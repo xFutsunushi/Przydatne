@@ -1,3 +1,5 @@
+```bash
+
 swapoff -a
 vi /etc/fstab - komentujemy swapa
 
@@ -87,3 +89,5 @@ kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/
 
 #Calico:
 #kubectl apply -f https://docs.projectcalico.org/v3.14/manifests/calico.yaml
+
+```
