@@ -1,4 +1,4 @@
-``` bash
+```bash
 
 swapoff -a
 vi /etc/fstab - komentujemy swapa
