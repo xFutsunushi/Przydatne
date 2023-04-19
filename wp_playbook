@@ -1,0 +1,192 @@
+  - hosts: default
+    become: true
+    vars:
+      container_name: ubuntu
+      db_user: wordpress
+      db_password: wordpress
+      db_name: wordpress
+      outside_port_nginx: 80
+      inside_port_nginx: 80
+      outside_port_apache: 81
+      inside_port_apache: 81
+    tasks:
+      - name: 1) Install LXC (python3,
+        apt:
+          name: "{{ item }}"
+          state: latest
+        loop:
+          - lxc
+          - lxc-templates
+          - python3-lxc
+
+      - name: 1) LXC with Ubuntu 
+        community.general.lxc_container:
+          name: "{{ item.name }}"
+          template: "{{ item.dist }}"
+          state: started
+          template_options: --release "{{ item.release }}"
+        loop:
+        - { name: "{{ container_name }}", dist: 'ubuntu', release: 'focal' }
+        register: lxc_container
+
+      - name: 3) Install LAMP
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            apt-get -y update
+            apt-get -y install wget curl iptables apache2 php mysql-server mysql-client libapache2-mod-php php-mysql php-gd php-json php-curl php-xml php-xmlrpc
+    
+      - name: Set Apache port to 81
+        ansible.builtin.lineinfile:
+          path: "/var/lib/lxc/{{ container_name }}/rootfs/etc/apache2/ports.conf"
+          regexp: '^Listen 80'
+          line: Listen 81
+      
+      - name: Real IP with Apache
+        ansible.builtin.copy:
+          dest: "/var/lib/lxc/{{ container_name }}/rootfs/etc/apache2/conf-available/remoteip.conf"
+          content: |
+            RemoteIPInternalProxy 127.0.0.1
+            RemoteIPHeader X-Real-IP
+
+      - name: Reload apache and apply port 81
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            a2enmod remoteip
+            systemctl restart apache2
+      
+      - name: Enable lxc-net (need for wordpress download)
+        ansible.builtin.systemd:
+          name: lxc-net
+          state: started
+          enabled: yes
+
+      - name: wordpress_folder  
+        stat: 
+          path: "/var/lib/lxc/{{ container_name }}/rootfs/var/www/html/wordpress"
+        register: wordpress_folder
+
+      - name: Install wordpress
+        ansible.builtin.unarchive:
+          src: http://wordpress.org/latest.tar.gz
+          dest: "/var/lib/lxc/{{ container_name }}/rootfs/var/www/html"
+          remote_src: yes
+          owner: www-data
+          group: www-data
+          mode: '0755'
+        when: not wordpress_folder.stat.exists
+
+      - name: Install nginx
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            apt-get install -y nginx
+
+      - name: Create folder for ssl
+        ansible.builtin.file:
+          path: "/var/lib/lxc/{{ container_name }}/rootfs/etc/nginx/ssl"
+          state: directory
+      
+      - name: Create private key
+        community.crypto.openssl_privatekey:
+          path: "/var/lib/lxc/{{ container_name }}/rootfs/etc/nginx/ssl/certificate.key"
+
+      - name: Create simple self-signed certificate
+        community.crypto.x509_certificate:
+          path: "/var/lib/lxc/{{ container_name }}/rootfs/etc/nginx/ssl/certificate.pem"
+          privatekey_path: "/var/lib/lxc/{{ container_name }}/rootfs/etc/nginx/ssl/certificate.key"
+          provider: selfsigned
+      
+      - name: Set nginx as reverse proxy (nginx 80 -> apache 81)
+        ansible.builtin.copy:
+          dest: "/var/lib/lxc/{{ container_name }}/rootfs/etc/nginx/sites-available/default"
+          owner: root
+          group: root
+          mode: '0644'
+          content: |
+            server {
+            listen 80 ssl http2;
+            listen [::]:80 ssl http2;
+            root /var/www/html;
+            # SSL
+            ssl_certificate /etc/nginx/ssl/certificate.pem;
+            ssl_certificate_key /etc/nginx/ssl/certificate.key;
+            ssl_protocols TLSv1.2 TLSv1.1 TLSv1;
+            # Redirect http to https
+            # return 301 https://$host$request_uri;
+            server_name _;
+             location / {
+             proxy_pass http://localhost:81;
+             proxy_http_version  1.1;
+             proxy_set_header Host              $host;
+             proxy_set_header X-Real-IP         $remote_addr;
+             proxy_set_header X-Forwarded-For   $http_x_forwarded_for;
+             proxy_set_header X-Forwarded-Proto $scheme;
+             }
+            }
+
+      - name: Restart nginx
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            systemctl restart nginx
+
+      - name: Block 81 port
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            iptables -C INPUT -p tcp -s 127.0.0.1 --destination-port 81 -j ACCEPT || iptables -A INPUT -p tcp -s 127.0.0.1 --destination-port 81 -j ACCEPT
+            iptables -C INPUT -p tcp --destination-port 81 -j REJECT || iptables -A INPUT -p tcp --destination-port 81 -j REJECT
+      
+      - name: Create Mysql DB
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          container_command: |
+            mysql -u root -ne "CREATE DATABASE {{ db_name }};"
+            mysql -u root -ne "CREATE USER '{{ db_user }}'@'localhost' IDENTIFIED BY '{{ db_password }}'"
+            mysql -u root -ne "ALTER USER '{{ db_user }}'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ db_password }}';"
+            mysql -u root -ne "GRANT ALL PRIVILEGES ON {{ db_name }}.* TO '{{ db_user }}'@'localhost' WITH GRANT OPTION;"
+            mysql -u root -ne "FLUSH PRIVILEGES;"
+
+      - name: Create file wp-config.php
+        ansible.builtin.copy:
+          dest: "/var/lib/lxc/{{ container_name }}/rootfs/var/www/html/wordpress/wp-config.php"
+          owner: www-data
+          group: www-data
+          mode: '0755'
+          content: |
+            <?php
+            define( 'DB_NAME', '{{ db_name }}' );
+            define( 'DB_USER', '{{ db_user }}' );
+            define( 'DB_PASSWORD', '{{ db_password }}' );
+            define( 'DB_HOST', 'localhost' );
+            define( 'DB_CHARSET', 'utf8' );
+            define( 'DB_COLLATE', '' );
+
+            define( 'AUTH_KEY',         'put your unique phrase here' );
+            define( 'SECURE_AUTH_KEY',  'put your unique phrase here' );
+            define( 'LOGGED_IN_KEY',    'put your unique phrase here' );
+            define( 'NONCE_KEY',        'put your unique phrase here' );
+            define( 'AUTH_SALT',        'put your unique phrase here' );
+            define( 'SECURE_AUTH_SALT', 'put your unique phrase here' );
+            define( 'LOGGED_IN_SALT',   'put your unique phrase here' );
+            define( 'NONCE_SALT',       'put your unique phrase here' );
+
+            $table_prefix = 'wp_';
+            define( 'WP_DEBUG', false );
+            if ( ! defined( 'ABSPATH' ) ) {
+            define( 'ABSPATH', __DIR__ . '/' );
+            }
+            require_once ABSPATH . 'wp-settings.php';
+
+      - name: LXC stop
+        community.general.lxc_container:
+          name: "{{ container_name }}"
+          state: stopped
+      
+      - name: chroot
+        ansible.builtin.shell: |
+          chroot /var/lib/lxc/{{ container_name }}/rootfs /usr/sbin/apachectl start
+          chroot /var/lib/lxc/{{ container_name }}/rootfs /etc/init.d/mysql start
+          chroot /var/lib/lxc/{{ container_name }}/rootfs /etc/init.d/nginx start
