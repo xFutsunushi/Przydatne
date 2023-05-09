@@ -91,7 +91,7 @@ sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 sudo kubeadm config images pull --cri-socket /run/cri-dockerd.sock 
 
-kubeadm init --control-plane-endpoint=k8smaster.proxya.loc --pod-network-cidr=10.244.0.0/16--cri-socket=unix:///run/cri-dockerd.sock
+kubeadm init --control-plane-endpoint=k8smaster.proxya.loc --pod-network-cidr=10.244.0.0/16 --cri-socket=unix:///run/cri-dockerd.sock
 
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
